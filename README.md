@@ -184,6 +184,11 @@ Header: `Authorization: Bearer lb_your_token_here`
 - URL: `http://127.0.0.1:18080/mcp`
 - Headers: `{"Authorization": "Bearer lb_your_token_here"}`
 
+**Gemini Web (gemini.google.com → Connected apps → Custom MCP server)**:
+- Gemini requires an `https://` URL and OAuth. The Nexus MCP Bridge ships a built-in OAuth 2.1 server (Dynamic Client Registration + PKCE S256).
+- Expose the Bridge with `cloudflared tunnel --url http://127.0.0.1:8787`, enter `https://<tunnel-host>/mcp` in Gemini, leave Client ID/Secret empty, then approve on the Nexus consent page by entering your local Bridge token.
+- Full guide (Chinese): [docs/GEMINI_WEB_SETUP.md](docs/GEMINI_WEB_SETUP.md)
+
 ---
 
 ### 6. Development & Quality Verification
@@ -380,6 +385,11 @@ Header 添加：`Authorization: Bearer lb_your_token_here`
 - 传输类型：`Streamable HTTP`
 - 请求地址：`http://127.0.0.1:18080/mcp`
 - 标头参数：`{"Authorization": "Bearer lb_your_token_here"}`
+
+**Gemini 网页版（gemini.google.com → 关联应用 → 自定义 MCP 服务器）**：
+- Gemini 要求 `https://` 地址与 OAuth 鉴权，Nexus MCP Bridge 已内置 OAuth 2.1 授权服务器（动态客户端注册 + PKCE S256）。
+- 运行 `cloudflared tunnel --url http://127.0.0.1:8787` 暴露 Bridge，在 Gemini 中填写 `https://<隧道地址>/mcp`，客户端 ID/密钥留空，在弹出的 Nexus 授权页输入本机 Bridge 令牌并批准。
+- 详细教程：[docs/GEMINI_WEB_SETUP.md](docs/GEMINI_WEB_SETUP.md)
 
 ---
 

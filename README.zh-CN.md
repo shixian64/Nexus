@@ -104,6 +104,18 @@ LocalBridge 既可作为预打包的独立桌面应用（Tauri 安装包）运�
 
 现在你的 AI 助手即可在受限项目边界内，安全调用全部 23 个官方 MCP 工具！
 
+#### 接入 Gemini 网页版（关联应用 → 自定义 MCP 服务器）
+
+Gemini 网页版要求 HTTPS 地址和 OAuth 鉴权。Nexus Bridge 内置 OAuth 2.1 授权服务器（动态客户端注册 + PKCE），配合 Cloudflare 隧道即可接入：
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:8787
+# 在 Gemini「设置 → 关联应用 → 自定义」中填写 https://<隧道地址>/mcp，客户端 ID/密钥留空
+# 在弹出的 Nexus 授权页输入本机 Bridge 令牌并批准
+```
+
+完整图文步骤、安全说明与故障排查见 **[docs/GEMINI_WEB_SETUP.md](docs/GEMINI_WEB_SETUP.md)**。
+
 ---
 
 ## 开发者与 CLI 运维操作

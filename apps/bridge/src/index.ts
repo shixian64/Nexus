@@ -30,6 +30,7 @@ import {
   handleNexusProxyRequest,
 } from "./browser-portal.js";
 import { UnityGameDevMcpProvider } from "./unity-gamedev-provider.js";
+import { OAuthProvider } from "./oauth.js";
 
 function resolveBaseUrl(req: http.IncomingMessage): string {
   if (process.env.PUBLIC_BASE_URL) {
@@ -38,6 +39,40 @@ function resolveBaseUrl(req: http.IncomingMessage): string {
   const host = req.headers.host || "127.0.0.1:8787";
   const proto = (req.headers["x-forwarded-proto"] as string) || "http";
   return `${proto}://${host}`;
+}
+
+/**
+ * Public origin as seen by remote clients (used for OAuth metadata/issuer).
+ * Prefers an explicit https PUBLIC_BASE_URL; otherwise derives it from the
+ * tunnel's forwarded Host so a Quick Tunnel URL works without restarting.
+ */
+function resolvePublicBaseUrl(req: http.IncomingMessage): string {
+  const configured = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+  if (configured.startsWith("https://")) {
+    return configured;
+  }
+  if (!isDirectLocalhostRequest(req)) {
+    const forwardedHost = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
+    if (forwardedHost && !isLoopbackHost(forwardedHost)) {
+      const proto = String(req.headers["x-forwarded-proto"] || "https").split(",")[0].trim() || "https";
+      return `${proto}://${forwardedHost}`;
+    }
+  }
+  return resolveBaseUrl(req).replace(/\/+$/, "");
+}
+
+/** Paths reachable through a tunnel/proxy. Everything else is loopback-only. */
+function isRemotelyExposedPath(pathname: string): boolean {
+  return (
+    pathname === "/" ||
+    pathname === "/health" ||
+    pathname === "/mcp" ||
+    pathname.startsWith("/mcp/") ||
+    pathname === "/api/mcp" ||
+    pathname.startsWith("/oauth/") ||
+    pathname.startsWith("/.well-known/oauth-") ||
+    pathname.startsWith("/.well-known/openid-configuration")
+  );
 }
 
 function getOrCreateBridgeToken(): string {
@@ -128,6 +163,12 @@ const nexusClient = new NexusClient({
 });
 
 ProviderRegistry.getInstance().setNexusClient(nexusClient);
+
+const OAUTH_STORE_PATH = process.env.NEXUS_OAUTH_STORE_PATH || (
+  process.env.LOCALAPPDATA
+    ? path.join(process.env.LOCALAPPDATA, "LocalBridge", "data", "oauth-store.json")
+    : path.join(process.env.HOME || process.env.USERPROFILE || ".", ".localbridge", "data", "oauth-store.json")
+);
 
 
 export class RateLimiter {
@@ -237,6 +278,25 @@ export function resetRateLimits(): void {
 function checkAuthRateLimit(req: http.IncomingMessage): boolean {
   const clientIp = getTrustedClientIp(req);
   return authRateLimiter.check(clientIp);
+}
+
+export const oauthProvider = new OAuthProvider({
+  approvalSecret: BRIDGE_TOKEN,
+  storePath: OAUTH_STORE_PATH,
+  checkApprovalRateLimit: checkAuthRateLimit,
+  checkRegistrationRateLimit: (req) => registrationRateLimits.check(getTrustedClientIp(req)),
+  staticClient:
+    process.env.NEXUS_OAUTH_CLIENT_ID && process.env.NEXUS_OAUTH_CLIENT_SECRET
+      ? { clientId: process.env.NEXUS_OAUTH_CLIENT_ID.trim(), clientSecret: process.env.NEXUS_OAUTH_CLIENT_SECRET.trim() }
+      : undefined,
+});
+
+/** Accepts the static Bridge token or an OAuth access token. */
+function isAuthorizedMcpBearer(authHeader: string | undefined): boolean {
+  if (!authHeader) return false;
+  if (validateRequestAuth(authHeader, BRIDGE_TOKEN).valid) return true;
+  const parts = authHeader.trim().split(/\s+/);
+  return parts.length === 2 && parts[0].toLowerCase() === "bearer" && oauthProvider.validateAccessToken(parts[1]);
 }
 
 export function isLoopbackHost(hostHeader?: string): boolean {
@@ -420,10 +480,27 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  const isDirectLocal = isDirectLocalhostRequest(req);
+  const publicBaseUrl = resolvePublicBaseUrl(req);
+
+  // 1.0 Tunnel/proxy exposure guard: only MCP, OAuth and health endpoints are
+  // reachable remotely. Management/execution APIs stay loopback-only.
+  if (!isDirectLocal && !isRemotelyExposedPath(pathname) && process.env.NEXUS_BRIDGE_ALLOW_REMOTE_ADMIN !== "1") {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not Found" }));
+    return;
+  }
+
+  // 1.0.1 OAuth 2.1 Authorization Server + discovery metadata (remote MCP clients such as Gemini)
+  if (await oauthProvider.handle(req, res, pathname, url, publicBaseUrl)) {
+    return;
+  }
+
   // 1.1 Handle HEAD Probes
   if (req.method === "HEAD" && (pathname === "/mcp" || pathname === "/health" || pathname === "/")) {
     res.writeHead(200, {
       "Content-Type": "application/json",
+      Link: `<${oauthProvider.resourceMetadataUrl(publicBaseUrl)}>; rel="oauth-protected-resource"`,
     });
     res.end();
     return;
@@ -1615,6 +1692,15 @@ const server = http.createServer(async (req, res) => {
       pathname === "/api/mcp" ||
       (pathname === "/" && req.headers.accept?.includes("text/event-stream")))
   ) {
+    if (!isDirectLocal && !isAuthorizedMcpBearer(req.headers.authorization)) {
+      res.setHeader(
+        "WWW-Authenticate",
+        oauthProvider.wwwAuthenticate(publicBaseUrl, req.headers.authorization ? "invalid_token" : undefined)
+      );
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized: Bearer token required for remote MCP access" }));
+      return;
+    }
     if (req.headers.accept?.includes("text/event-stream")) {
       const headerSessionId = (
         req.headers["mcp-session-id"] ||
@@ -1825,16 +1911,16 @@ const server = http.createServer(async (req, res) => {
     // 2) If no Authorization header is provided, ONLY permit confirmed direct localhost connections.
     //    All external, proxied, or tunneled requests without a valid Bearer token are rejected with 401.
     if (req.headers.authorization) {
-      const authCheck = validateRequestAuth(req.headers.authorization, BRIDGE_TOKEN);
-      if (!authCheck.valid) {
-        res.setHeader("WWW-Authenticate", 'Bearer realm="LocalBridge MCP", error="invalid_token"');
+      if (!isAuthorizedMcpBearer(req.headers.authorization)) {
+        const authError = validateRequestAuth(req.headers.authorization, BRIDGE_TOKEN).error || "Invalid token";
+        res.setHeader("WWW-Authenticate", oauthProvider.wwwAuthenticate(publicBaseUrl, "invalid_token"));
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             jsonrpc: "2.0",
             error: {
               code: -32000,
-              message: `Unauthorized: ${authCheck.error || "Invalid token"}. Valid Bearer token required.`,
+              message: `Unauthorized: ${authError}. Valid Bearer token required.`,
             },
             id: parsedBody?.id ?? null,
           })
@@ -1844,13 +1930,13 @@ const server = http.createServer(async (req, res) => {
           ip: req.socket.remoteAddress,
           durationMs: Date.now() - startTime,
           success: false,
-          error: authCheck.error || "Invalid token",
+          error: authError,
         });
         return;
       }
     } else {
-      if (!isDirectLocalhostRequest(req)) {
-        res.setHeader("WWW-Authenticate", 'Bearer realm="LocalBridge MCP", error="invalid_token"');
+      if (!isDirectLocal) {
+        res.setHeader("WWW-Authenticate", oauthProvider.wwwAuthenticate(publicBaseUrl));
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -1927,6 +2013,8 @@ server.listen(PORT, HOST, () => {
   console.log(`  Tool Manifest:        http://${HOST}:${PORT}/tools/manifest`);
   console.log(`  Downstream Nexus:     ${CORE_URL}`);
   console.log(`  Bearer Token Auth:    [${BRIDGE_TOKEN ? "ENABLED" : "DISABLED"}]`);
+  console.log(`  OAuth (remote MCP):   <public-https-url>/.well-known/oauth-authorization-server (PUBLIC_BASE_URL=${process.env.PUBLIC_BASE_URL})`);
+  console.log(`  OAuth store:          ${OAUTH_STORE_PATH}`);
   console.log("==================================================");
 
   // Eagerly initialize default providers (e.g. Unity GameDev MCP)
