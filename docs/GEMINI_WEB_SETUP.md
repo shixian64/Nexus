@@ -83,22 +83,40 @@ cloudflared --version
 ### 方式 B：源码运行
 
 ```powershell
-git clone https://github.com/shixian64/Nexus.git
+git clone https://github.com/ysunyang4/Nexus.git
 cd Nexus
 pnpm install
-pnpm --filter @localbridge/protocol build
+pnpm --filter "./packages/*" build
 
 # 启动桌面控制中心（会自动拉起 Core / Runner / Bridge）
 pnpm --filter @localbridge/desktop dev
 ```
 
-如果只想单独运行各服务，可分别在不同终端执行：
+### 方式 C：不用桌面端，分别启动各服务（无 GUI / 服务器环境）
+
+在**同一个 PowerShell 7（`pwsh`）会话**里先准备令牌（三个服务共用）：
 
 ```powershell
-.\OPEN-SOURCE-START.ps1 -Mode server   # Core :18080
-pnpm --filter @localbridge/runner dev  # Runner
-.\OPEN-SOURCE-START.ps1 -Mode bridge   # Bridge :8787
+$env:LOCALBRIDGE_MANAGEMENT_TOKEN = "lm_" + [Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLower()
+$env:NEXUS_MANAGEMENT_TOKEN = $env:LOCALBRIDGE_MANAGEMENT_TOKEN
+$env:LOCALBRIDGE_BOOTSTRAP_RUNNER_TOKEN = "lbr_" + [Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLower()
+# 关键：让 Core 不占用 8787，把端口留给 MCP Bridge
+$env:NEXUS_DISABLE_INTERNAL_GATEWAY = "true"
 ```
+
+然后分别启动（可用 `Start-Process pwsh` 或多个终端，确保环境变量一致）：
+
+```powershell
+# 1) Core :18080
+cd apps\server;  npx tsx src/index.ts
+# 2) Runner（连接 Core）
+cd apps\runner;  npx tsx src/index.ts --token $env:LOCALBRIDGE_BOOTSTRAP_RUNNER_TOKEN --name "My PC"
+# 3) MCP Bridge :8787
+cd apps\bridge;  npx tsx src/index.ts
+```
+
+> 也可以用 `.\OPEN-SOURCE-START.ps1 -Mode server` / `-Mode bridge`（需先 `pnpm --dir apps/server build`、`pnpm --dir apps/bridge build`），脚本会自动设置 `NEXUS_DISABLE_INTERNAL_GATEWAY`。
+> ⚠️ 如果 Core 先启动且没有关闭内置网关，它会占用 8787，Bridge 将无法启动。
 
 ### 验证 Bridge 已启动
 
@@ -119,6 +137,16 @@ curl http://127.0.0.1:8787/health
    - **执行模式**：`禁用执行` / `仅安全工具` / `允许项目脚本`
 
 > 💡 第一次使用建议先选 **只读 + 禁用执行**，确认一切正常后再放开。Gemini 只能访问你在这里授权的目录。
+
+没有桌面端时，用 Runner 命令行授权（授权后需**重启 Runner** 才会同步到 Core）：
+
+```powershell
+cd apps\runner
+npx tsx src/cli/project-cli.ts add "D:\Projects\my-app" --name my-app
+npx tsx src/cli/project-cli.ts set-access <项目ID> read-write          # 默认 read-only
+npx tsx src/cli/project-cli.ts set-execution <项目ID> disabled          # disabled | safe-only | project-code
+npx tsx src/cli/project-cli.ts list
+```
 
 ---
 
@@ -207,6 +235,16 @@ curl -i -X POST https://<你的隧道地址>/mcp
 ```
 
 如果 Gemini 没有调用工具，可以在提示里明确说“使用 Nexus 工具”。
+
+**关于工具列表**：为了节省 Token，Bridge 只向 Gemini 暴露 3 个元工具，由它按需检索并调用底层 300+ 工具：
+
+| 元工具 | 作用 |
+| :--- | :--- |
+| `nexus_discover_tools` | 按关键词搜索底层工具（如 “project list”、“文件”） |
+| `nexus_execute_action` | 执行单个底层工具，例如 `localbridge_project_list`、`localbridge_file_read`、`localbridge_file_create` |
+| `nexus_run_script` | 多步操作批量执行 |
+
+因此在 Gemini 的连接器详情里只看到 3 个工具是正常的。注意修改已有文件的 `localbridge_file_write` 需要先读取得到 `expectedHash`（防止覆盖并发修改），新建文件用 `localbridge_file_create`。
 
 - 访问令牌有效期 1 小时，Gemini 会用刷新令牌自动续期（刷新令牌 30 天，轮换使用）。
 - 所有工具调用仍受 Nexus 本地权限策略约束：只读项目无法写入，高危命令会在桌面端弹出审批窗口，需要你本人点击确认。

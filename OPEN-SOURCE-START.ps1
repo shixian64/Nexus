@@ -44,6 +44,12 @@ if ($Mode -eq "bridge" -or $Mode -eq "desktop") {
 Write-Host "Nexus v1.3.1 OPEN edition | Mode: $Mode | Secure stores: enabled"
 Write-Host "Local execution tools require an explicit NEXUS_REMOTE_ALLOWED_TOOLS allowlist."
 
+if ($Mode -eq "server") {
+  # The dedicated Bridge (-Mode bridge) owns 127.0.0.1:8787. Without this, Core starts
+  # its integrated fallback gateway on 8787 and the Bridge fails to bind.
+  $env:NEXUS_DISABLE_INTERNAL_GATEWAY = "true"
+}
+
 switch ($Mode) {
   "server"  { pnpm --dir apps/server start }
   "bridge"  { pnpm --dir apps/bridge start }
